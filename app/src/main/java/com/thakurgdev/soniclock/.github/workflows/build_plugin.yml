@@ -17,17 +17,27 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Create Gradle Build Files
+      - name: Create Plugin Project Structure
         run: |
-          mkdir -p app/src/main
-          echo 'android { namespace "com.thakurgdev.soniclock" compileSdk 34 defaultConfig { minSdk 24 targetSdk 34 } }' > app/build.gradle
+          mkdir -p app/src/main/java/com/thakurgdev/soniclock
+          echo 'plugins { id "com.android.library" }' > app/build.gradle
+          echo 'android { namespace "com.thakurgdev.soniclock" compileSdk 34 defaultConfig { minSdk 24 targetSdk 34 } }' >> app/build.gradle
+          echo 'dependencies { implementation "org.godotengine:godot:4.2.1.stable" }' >> app/build.gradle
+          echo 'include(":app")' > settings.gradle
 
-      - name: Build AAR with Gradle
+      - name: Move Kotlin File to Gradle Source
         run: |
-          echo "building aar..."
+          cp app/src/main/java/com/thakurgdev/soniclock/SystemAudioLockerPlugin.kt app/src/main/java/com/thakurgdev/soniclock/SystemAudioLocker.kt || true
 
-      - name: Upload Artifact
+      - name: Build AAR Package
+        run: |
+          chmod +x gradlew || true
+          ./gradlew assembleRelease || echo "Gradle wrapper missing, generating..."
+          gradle wrapper
+          ./gradlew assembleRelease
+
+      - name: Upload AAR Artifact
         uses: actions/upload-artifact@v4
         with:
           name: SystemAudioLocker-release
-          path: app/build.outputs/aar/
+          path: app/build/outputs/aar/app-release.aar
