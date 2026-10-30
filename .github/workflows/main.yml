@@ -1,0 +1,371 @@
+name: Build Godot Android Plugin
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Generate Complete Android Plugin Project
+        run: |
+          mkdir -p plugin/src/main/java/com/thakurgdev/soniclock
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "SystemAudioLocker"
+          include(":plugin")
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.library' version '8.2.0' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+
+          cat << 'EOF' > plugin/build.gradle
+          plugins {
+              id 'com.android.library'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.thakurgdev.soniclock'
+              compileSdk 34
+              defaultConfig {
+                  minSdk 26
+                  targetSdk 34
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          dependencies {
+              compileOnly 'org.godotengine:godot:4.2.1.stable'
+          }
+          EOF
+
+          cat << 'EOF' > plugin/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+              <application>
+                  <meta-data
+                      android:name="org.godotengine.plugin.v1.SystemAudioLocker"
+                      android:value="com.thakurgdev.soniclock.SystemAudioLocker" />
+                  <meta-data
+                      android:name="org.godotengine.plugin.v2.SystemAudioLocker"
+                      android:value="com.thakurgdev.soniclock.SystemAudioLocker" />
+
+                  <service
+                      android:name="com.thakurgdev.soniclock.AudioLockService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaPlayback" />
+
+                  <receiver
+                      android:name="com.thakurgdev.soniclock.NotifActionReceiver"
+                      android:exported="false" />
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > plugin/src/main/java/com/thakurgdev/soniclock/SystemAudioLocker.kt
+          package com.thakurgdev.soniclock
+
+          import android.app.*
+          import android.content.*
+          import android.media.audiofx.DynamicsProcessing
+          import android.media.audiofx.LoudnessEnhancer
+          import android.net.Uri
+          import android.os.Build
+          import android.os.IBinder
+          import android.os.PowerManager
+          import android.provider.Settings
+          import org.godotengine.godot.Godot
+          import org.godotengine.godot.plugin.GodotPlugin
+          import org.godotengine.godot.plugin.SignalInfo
+          import org.godotengine.godot.plugin.UsedByGodot
+
+          class SystemAudioLocker(godot: Godot) : GodotPlugin(godot) {
+
+              companion object {
+                  var instance: SystemAudioLocker? = null
+                  var currentMode: Int = 1
+                  var masterPct: Int = 100
+                  var bassPct: Int = 100
+                  var treblePct: Int = 100
+                  var isPaused: Boolean = false
+              }
+
+              init {
+                  instance = this
+              }
+
+              override fun getPluginName(): String = "SystemAudioLocker"
+
+              override fun getPluginSignals(): MutableSet<SignalInfo> {
+                  return mutableSetOf(
+                      SignalInfo("notification_volume_step", Integer::class.javaObjectType),
+                      SignalInfo("notification_mode_switch"),
+                      SignalInfo("notification_pause_toggle", java.lang.Boolean::class.javaObjectType),
+                      SignalInfo("notification_stop")
+                  )
+              }
+
+              @UsedByGodot
+              fun request_background_permissions() {
+                  val act = activity ?: return
+                  try {
+                      val pm = act.getSystemService(Context.POWER_SERVICE) as PowerManager
+                      if (!pm.isIgnoringBatteryOptimizations(act.packageName)) {
+                          val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                              data = Uri.parse("package:${act.packageName}")
+                          }
+                          act.startActivity(intent)
+                      }
+                  } catch (_: Exception) {}
+              }
+
+              @UsedByGodot
+              fun apply_audio_profile(mode: Int, master: Int, bass: Int, treble: Int, paused: Boolean) {
+                  val act = activity ?: return
+                  currentMode = mode
+                  masterPct = master.coerceIn(0, 300)
+                  bassPct = bass.coerceIn(0, 300)
+                  treblePct = treble.coerceIn(0, 300)
+                  isPaused = paused
+
+                  val intent = Intent(act, AudioLockService::class.java)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      act.startForegroundService(intent)
+                  } else {
+                      act.startService(intent)
+                  }
+              }
+
+              @UsedByGodot
+              fun stop_audio_service() {
+                  val act = activity ?: return
+                  act.stopService(Intent(act, AudioLockService::class.java))
+              }
+
+              fun notifyVolumeStep(delta: Int) {
+                  emitSignal("notification_volume_step", Integer.valueOf(delta))
+              }
+
+              fun notifyModeSwitch() {
+                  emitSignal("notification_mode_switch")
+              }
+
+              fun notifyPauseToggle(newPaused: Boolean) {
+                  emitSignal("notification_pause_toggle", java.lang.Boolean.valueOf(newPaused))
+              }
+
+              fun notifyStop() {
+                  emitSignal("notification_stop")
+              }
+          }
+
+          class AudioLockService : Service() {
+              private var dp: DynamicsProcessing? = null
+              private var enhancer: LoudnessEnhancer? = null
+              private val channelId = "sonic_lock_channel"
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  createChannel()
+                  startForeground(1001, buildNotif())
+                  applyDsp()
+                  return START_STICKY
+              }
+
+              private fun applyDsp() {
+                  try {
+                      if (SystemAudioLocker.isPaused) {
+                          dp?.enabled = false
+                          enhancer?.enabled = false
+                          return
+                      }
+
+                      val mPct = SystemAudioLocker.masterPct
+                      val bPct = SystemAudioLocker.bassPct
+                      val tPct = SystemAudioLocker.treblePct
+                      val isSteady = (SystemAudioLocker.currentMode == 1)
+
+                      val masterDb = ((mPct - 100) * 0.18f)
+                      val bassDb = ((bPct - 100) * 0.12f)
+                      val trebleDb = ((tPct - 100) * 0.12f)
+
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                          if (dp == null) {
+                              val cfg = DynamicsProcessing.Config.Builder(
+                                  DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
+                                  2, true, 2, true, 2, false, 0, true
+                              ).build()
+                              dp = DynamicsProcessing(0, 0, cfg)
+                          }
+                          dp?.let { engine ->
+                              val bassBand = DynamicsProcessing.EqBand(true, 250f, bassDb)
+                              val trebleBand = DynamicsProcessing.EqBand(true, 16000f, trebleDb)
+                              engine.setPreEqBandAllChannelsTo(0, bassBand)
+                              engine.setPreEqBandAllChannelsTo(1, trebleBand)
+
+                              val ratio = if (isSteady) 12.0f else 1.15f
+                              val thresh = if (isSteady) -38.0f else -10.0f
+                              val mbcBand0 = DynamicsProcessing.MbcBand(
+                                  true, 250f, 3f, 80f, ratio, thresh, 6f, -55f, 1f, 0f, bassDb
+                              )
+                              val mbcBand1 = DynamicsProcessing.MbcBand(
+                                  true, 16000f, 3f, 80f, ratio, thresh, 6f, -55f, 1f, 0f, trebleDb
+                              )
+                              engine.setMbcBandAllChannelsTo(0, mbcBand0)
+                              engine.setMbcBandAllChannelsTo(1, mbcBand1)
+
+                              val ceil = if (isSteady) (masterDb.coerceAtMost(0f)) else 0f
+                              val lim = DynamicsProcessing.Limiter(
+                                  true, true, 0, 2f, 50f, if (isSteady) 15f else 4f, ceil, masterDb
+                              )
+                              engine.setLimiterAllChannelsTo(lim)
+                              engine.enabled = true
+                          }
+                      }
+
+                      if (enhancer == null) {
+                          enhancer = LoudnessEnhancer(0)
+                      }
+                      enhancer?.let { le ->
+                          val boostMb = if (mPct > 100) ((mPct - 100) * 15) else 0
+                          le.setTargetGain(boostMb)
+                          le.enabled = (mPct > 100)
+                      }
+                  } catch (_: Exception) {}
+              }
+
+              private fun makePending(action: String, reqCode: Int): PendingIntent {
+                  val i = Intent(this, NotifActionReceiver::class.java).apply { this.action = action }
+                  val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  return PendingIntent.getBroadcast(this, reqCode, i, flags)
+              }
+
+              private fun buildNotif(): Notification {
+                  val modeName = if (SystemAudioLocker.currentMode == 1) "Steady Lock" else "Dynamic Boost"
+                  val otherMode = if (SystemAudioLocker.currentMode == 1) "Switch: Dynamic" else "Switch: Steady"
+                  val pauseLabel = if (SystemAudioLocker.isPaused) "Resume" else "Pause"
+                  val statusText = if (SystemAudioLocker.isPaused) "PAUSED" else "${SystemAudioLocker.masterPct}%"
+
+                  val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      Notification.Builder(this, channelId)
+                  } else {
+                      Notification.Builder(this)
+                  }
+
+                  builder.setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
+                      .setContentTitle("Sonic Lock • $modeName ($statusText)")
+                      .setContentText("Tap notification to $otherMode | Bass: ${SystemAudioLocker.bassPct}% | Treble: ${SystemAudioLocker.treblePct}%")
+                      .setProgress(300, SystemAudioLocker.masterPct, false)
+                      .setOngoing(true)
+                      .setContentIntent(makePending("ACTION_SWITCH_MODE", 10))
+                      .addAction(0, "-10%", makePending("ACTION_VOL_DOWN", 1))
+                      .addAction(0, "+10%", makePending("ACTION_VOL_UP", 2))
+                      .addAction(0, pauseLabel, makePending("ACTION_PAUSE_TOGGLE", 3))
+                      .addAction(0, "Stop", makePending("ACTION_STOP", 4))
+
+                  return builder.build()
+              }
+
+              private fun createChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val ch = NotificationChannel(
+                          channelId, "Sonic Lock Service", NotificationManager.IMPORTANCE_LOW
+                      )
+                      val nm = getSystemService(NotificationManager::class.java)
+                      nm?.createNotificationChannel(ch)
+                  }
+              }
+
+              override fun onDestroy() {
+                  try {
+                      dp?.enabled = false
+                      dp?.release()
+                      enhancer?.enabled = false
+                      enhancer?.release()
+                  } catch (_: Exception) {}
+                  super.onDestroy()
+              }
+          }
+
+          class NotifActionReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  when (intent.action) {
+                      "ACTION_VOL_DOWN" -> {
+                          SystemAudioLocker.masterPct = (SystemAudioLocker.masterPct - 10).coerceIn(0, 300)
+                          SystemAudioLocker.instance?.notifyVolumeStep(-10)
+                          context.startService(Intent(context, AudioLockService::class.java))
+                      }
+                      "ACTION_VOL_UP" -> {
+                          SystemAudioLocker.masterPct = (SystemAudioLocker.masterPct + 10).coerceIn(0, 300)
+                          SystemAudioLocker.instance?.notifyVolumeStep(10)
+                          context.startService(Intent(context, AudioLockService::class.java))
+                      }
+                      "ACTION_SWITCH_MODE" -> {
+                          SystemAudioLocker.currentMode = if (SystemAudioLocker.currentMode == 1) 2 else 1
+                          SystemAudioLocker.instance?.notifyModeSwitch()
+                          context.startService(Intent(context, AudioLockService::class.java))
+                      }
+                      "ACTION_PAUSE_TOGGLE" -> {
+                          SystemAudioLocker.isPaused = !SystemAudioLocker.isPaused
+                          SystemAudioLocker.instance?.notifyPauseToggle(SystemAudioLocker.isPaused)
+                          context.startService(Intent(context, AudioLockService::class.java))
+                      }
+                      "ACTION_STOP" -> {
+                          SystemAudioLocker.instance?.notifyStop()
+                          context.stopService(Intent(context, AudioLockService::class.java))
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Compile Release AAR with Gradle
+        run: |
+          gradle :plugin:assembleRelease
+          mkdir -p output_aar
+          cp plugin/build/outputs/aar/plugin-release.aar output_aar/SystemAudioLocker-release.aar
+
+      - name: Upload Compiled AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: SystemAudioLocker-release
+          path: output_aar/SystemAudioLocker-release.aar
