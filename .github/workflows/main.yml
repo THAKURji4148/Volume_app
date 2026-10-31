@@ -249,7 +249,7 @@ jobs:
                       if (!isPaused && currentMode == 0) {
                           enforceStreamVolume(masterVol)
                       }
-                      mainHandler.postDelayed(this, 600L)
+                      mainHandler.postDelayed(this, 500L)
                   }
               }
 
@@ -274,10 +274,8 @@ jobs:
                   instance = this
                   createNotificationChannel()
 
-                  // Attach global mix (session 0)
                   attachSessionEffects(0)
 
-                  // Listen for app audio sessions (YouTube, Spotify, Games, etc.)
                   val filter = IntentFilter().apply {
                       addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
                       addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
@@ -304,12 +302,11 @@ jobs:
                   } catch (_: Throwable) {}
 
                   refreshAllAudio()
-                  scheduleNotificationUpdate(immediate = false)
+                  scheduleNotificationUpdate(immediate = true)
                   return START_STICKY
               }
 
               fun refreshAllAudio() {
-                  val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                   if (!isPaused) {
                       enforceStreamVolume(masterVol)
                   }
@@ -341,7 +338,6 @@ jobs:
                               am.setStreamVolume(AudioManager.STREAM_MUSIC, targetHw, 0)
                           }
                       } else {
-                          // Booster active (>100%): keep hardware stream at 100% so DSP boost multiplies full signal
                           if (currentHw < maxHw) {
                               am.setStreamVolume(AudioManager.STREAM_MUSIC, maxHw, 0)
                           }
@@ -350,7 +346,6 @@ jobs:
               }
 
               private fun attachSessionEffects(sessionId: Int) {
-                  // 1. LoudnessEnhancer (Independent try-catch)
                   if (!loudnessMap.containsKey(sessionId)) {
                       try {
                           val le = LoudnessEnhancer(sessionId)
@@ -359,7 +354,6 @@ jobs:
                       } catch (_: Throwable) {}
                   }
 
-                  // 2. Equalizer (Independent try-catch)
                   if (!eqMap.containsKey(sessionId)) {
                       try {
                           val eq = Equalizer(100, sessionId)
@@ -368,7 +362,6 @@ jobs:
                       } catch (_: Throwable) {}
                   }
 
-                  // 3. BassBoost (Independent try-catch)
                   if (!bassMap.containsKey(sessionId)) {
                       try {
                           val bb = BassBoost(100, sessionId)
@@ -377,7 +370,6 @@ jobs:
                       } catch (_: Throwable) {}
                   }
 
-                  // 4. DynamicsProcessing Limiter (Works best on app sessions > 0)
                   if (sessionId > 0 && !dpMap.containsKey(sessionId) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                       try {
                           val builder = DynamicsProcessing.Config.Builder(
@@ -398,7 +390,6 @@ jobs:
               private fun applyEffectsToSession(sessionId: Int) {
                   val active = !isPaused
 
-                  // 1. Apply LoudnessEnhancer
                   loudnessMap[sessionId]?.let { le ->
                       try {
                           if (!active) {
@@ -406,11 +397,10 @@ jobs:
                               le.enabled = false
                           } else {
                               val boostPercent = (masterVol - 100).coerceAtLeast(0)
-                              // Up to 3600 mB (+36 dB) at 300%
                               val modeMultiplier = when (currentMode) {
-                                  0 -> 15 // Steady Lock controlled boost
-                                  1 -> 18 // Dynamic Boost
-                                  else -> 20 // Cinema Max
+                                  0 -> 30
+                                  1 -> 60
+                                  else -> 90
                               }
                               val gainMb = boostPercent * modeMultiplier
                               le.setTargetGain(gainMb)
@@ -419,7 +409,6 @@ jobs:
                       } catch (_: Throwable) {}
                   }
 
-                  // 2. Apply Equalizer (Bass, Treble, and Master Boost/Attenuation)
                   eqMap[sessionId]?.let { eq ->
                       try {
                           if (!active) {
@@ -431,26 +420,22 @@ jobs:
                               val minMb = range[0].toInt()
                               val maxMb = range[1].toInt()
 
-                              // Master extra EQ push when > 100%
-                              val masterExtraMb = if (masterVol > 100) ((masterVol - 100) * 6) else 0
-                              val bassDeltaMb = (bassVol - 100) * 7
-                              val trebleDeltaMb = (trebleVol - 100) * 7
+                              val masterExtraMb = if (masterVol > 100) ((masterVol - 100) * 8) else 0
+                              val bassDeltaMb = (bassVol - 100) * 8
+                              val trebleDeltaMb = (trebleVol - 100) * 8
 
                               for (b in 0 until numBands) {
                                   val freqMilliHz = eq.getCenterFreq(b.toShort())
                                   var targetMb = masterExtraMb
 
                                   if (freqMilliHz < 300_000) {
-                                      // Low/Bass frequencies (<300 Hz)
                                       targetMb += bassDeltaMb
-                                      if (currentMode == 2) targetMb += 400 // Cinema sub-bass boost
+                                      if (currentMode == 2) targetMb += 500
                                   } else if (freqMilliHz > 2_500_000) {
-                                      // High/Treble frequencies (>2.5 kHz)
                                       targetMb += trebleDeltaMb
-                                      if (currentMode == 0) targetMb += 250 // Steady Lock vocal clarity
+                                      if (currentMode == 0) targetMb += 300
                                   } else {
-                                      // Midrange vocal frequencies
-                                      if (currentMode == 0) targetMb += 350
+                                      if (currentMode == 0) targetMb += 400
                                   }
 
                                   val clamped = targetMb.coerceIn(minMb, maxMb).toShort()
@@ -460,7 +445,6 @@ jobs:
                       } catch (_: Throwable) {}
                   }
 
-                  // 3. Apply BassBoost
                   bassMap[sessionId]?.let { bb ->
                       try {
                           if (!active) {
@@ -473,7 +457,6 @@ jobs:
                       } catch (_: Throwable) {}
                   }
 
-                  // 4. Apply DynamicsProcessing (Hardware Limiter for Steady Lock)
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                       dpMap[sessionId]?.let { dp ->
                           try {
@@ -481,15 +464,13 @@ jobs:
                                   dp.enabled = false
                               } else {
                                   dp.enabled = true
-                                  val inputGainDb = if (masterVol > 100) ((masterVol - 100) * 0.12f) else 0f
+                                  val inputGainDb = if (masterVol > 100) ((masterVol - 100) * 0.3f) else 0f
                                   dp.setInputGainAllChannelsTo(inputGainDb)
 
                                   val limiter = if (currentMode == 0) {
-                                      // Strict Steady Lock Limiter: clamps sudden loud spikes
-                                      DynamicsProcessing.Limiter(true, true, 0, 1.0f, 40.0f, 10.0f, -3.0f, 0.0f)
+                                      DynamicsProcessing.Limiter(true, true, 0, 0.1f, 10.0f, 35.0f, -4.0f, 0.0f)
                                   } else {
-                                      // Soft safety limiter for Boost/Cinema modes
-                                      DynamicsProcessing.Limiter(true, true, 0, 5.0f, 60.0f, 4.0f, -1.0f, 0.0f)
+                                      DynamicsProcessing.Limiter(true, true, 0, 2.0f, 40.0f, 5.0f, -1.0f, 0.0f)
                                   }
                                   dp.setLimiterAllChannelsTo(limiter)
                               }
@@ -508,12 +489,11 @@ jobs:
               fun scheduleNotificationUpdate(immediate: Boolean) {
                   mainHandler.removeCallbacks(notifUpdateRunnable)
                   val now = SystemClock.elapsedRealtime()
-                  if (immediate || (now - lastNotifTime) > 250L) {
+                  if (immediate || (now - lastNotifTime) > 200L) {
                       postNotificationNow()
-                      // Also schedule a trailing check 150ms later so rapid slider drags always settle on exact final %
-                      mainHandler.postDelayed(notifUpdateRunnable, 150L)
+                      mainHandler.postDelayed(notifUpdateRunnable, 100L)
                   } else {
-                      mainHandler.postDelayed(notifUpdateRunnable, 120L)
+                      mainHandler.postDelayed(notifUpdateRunnable, 100L)
                   }
               }
 
@@ -619,9 +599,8 @@ jobs:
                               AudioLockService.isPaused = false
                               AudioLockService.currentMode = 0
                           } else if (AudioLockService.currentMode < 2) {
-                              AudioLockService.currentMode += 1
+                                AudioLockService.currentMode += 1
                           } else {
-                              // After Mode 2 (Cinema), cycling once more pauses/bypasses audio lock
                               AudioLockService.isPaused = true
                           }
                       }
