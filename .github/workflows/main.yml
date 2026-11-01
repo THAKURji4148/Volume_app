@@ -90,7 +90,6 @@ jobs:
 
           dependencies {
               compileOnly files('libs/godot-lib.aar')
-              implementation 'androidx.core:core-ktx:1.12.0'
           }
           EOF
 
@@ -113,10 +112,6 @@ jobs:
                       android:enabled="true"
                       android:exported="false"
                       android:foregroundServiceType="mediaPlayback" />
-
-                  <receiver
-                      android:name="com.thakurgdev.soniclock.NotifActionReceiver"
-                      android:exported="false" />
               </application>
           </manifest>
           EOF
@@ -132,7 +127,6 @@ jobs:
           import android.net.Uri
           import android.os.*
           import android.provider.Settings
-          import androidx.core.app.NotificationCompat
           import org.godotengine.godot.Godot
           import org.godotengine.godot.plugin.GodotPlugin
           import org.godotengine.godot.plugin.UsedByGodot
@@ -147,6 +141,11 @@ jobs:
               fun request_background_permissions() {
                   val act = activity ?: return
                   try {
+                      if (Build.VERSION.SDK_INT >= 33) {
+                          act.requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 101)
+                      }
+                  } catch (_: Throwable) {}
+                  try {
                       val pm = act.getSystemService(Context.POWER_SERVICE) as PowerManager
                       if (!pm.isIgnoringBatteryOptimizations(act.packageName)) {
                           val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
@@ -160,28 +159,43 @@ jobs:
               @UsedByGodot
               fun apply_audio_profile(mode: Int, masterVol: Int, bassVol: Int, trebleVol: Int, isPaused: Boolean) {
                   val ctx = activity?.applicationContext ?: return
+                  val newMaster = masterVol.coerceIn(0, 300)
+                  val masterChanged = (AudioLockService.masterVol != newMaster)
+
                   AudioLockService.currentMode = mode.coerceIn(0, 2)
-                  AudioLockService.masterVol = masterVol.coerceIn(0, 300)
+                  AudioLockService.masterVol = newMaster
                   AudioLockService.bassVol = bassVol.coerceIn(0, 300)
                   AudioLockService.trebleVol = trebleVol.coerceIn(0, 300)
                   AudioLockService.isPaused = isPaused
+
+                  // Only change hardware stream volume when the user actually changed masterVol in the app
+                  if (!isPaused && masterChanged) {
+                      AudioLockService.setHardwareVolumeOnce(ctx, newMaster)
+                  }
+
+                  // Apply GOODEV-style LoudnessEnhancer & Steady Lock DRC immediately
+                  AudioLockService.applyDspEngine()
+                  AudioLockService.ensureChannelAndPostNotif(ctx)
 
                   val intent = Intent(ctx, AudioLockService::class.java).apply {
                       action = AudioLockService.ACTION_APPLY_FROM_UI
                   }
                   try {
-                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                          ctx.startForegroundService(intent)
-                      } else {
-                          ctx.startService(intent)
-                      }
-                  } catch (_: Throwable) {}
+                      ctx.startService(intent)
+                  } catch (_: Throwable) {
+                      try {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                              ctx.startForegroundService(intent)
+                          }
+                      } catch (_: Throwable) {}
+                  }
               }
 
               @UsedByGodot
               fun stop_audio_service() {
                   val ctx = activity?.applicationContext ?: return
                   try {
+                      AudioLockService.releaseAllEnhancers()
                       ctx.stopService(Intent(ctx, AudioLockService::class.java))
                   } catch (_: Throwable) {}
               }
@@ -214,7 +228,7 @@ jobs:
           class AudioLockService : Service() {
 
               companion object {
-                  const val CHANNEL_ID = "steadylock_audio_channel_v2"
+                  const val CHANNEL_ID = "steadylock_goodev_channel_v4"
                   const val NOTIF_ID = 1001
 
                   const val ACTION_APPLY_FROM_UI = "com.thakurgdev.soniclock.APPLY_UI"
@@ -228,42 +242,232 @@ jobs:
                   @Volatile var trebleVol: Int = 100
                   @Volatile var isPaused: Boolean = false
                   @Volatile var externalSyncPending: Boolean = false
+                  @Volatile var lastAppHwSetTime: Long = 0L
 
-                  var instance: AudioLockService? = null
-              }
+                  private val mainHandler = Handler(Looper.getMainLooper())
+                  private var lastNotifTime = 0L
 
-              private val mainHandler = Handler(Looper.getMainLooper())
-              private var lastNotifTime = 0L
+                  // Pure GOODEV Architecture: ONLY LoudnessEnhancer on Session 0 & active sessions
+                  // (No Equalizer(0) or BassBoost(0) that conflicts with Xiaomi HyperOS HAL!)
+                  private var globalEnhancer: LoudnessEnhancer? = null
+                  private val sessionEnhancers = ConcurrentHashMap<Int, LoudnessEnhancer>()
 
-              private val loudnessMap = ConcurrentHashMap<Int, LoudnessEnhancer>()
-              private val eqMap = ConcurrentHashMap<Int, Equalizer>()
-              private val bassMap = ConcurrentHashMap<Int, BassBoost>()
-              private val dpMap = ConcurrentHashMap<Int, DynamicsProcessing>()
+                  fun setHardwareVolumeOnce(ctx: Context, volPercent: Int) {
+                      try {
+                          lastAppHwSetTime = SystemClock.elapsedRealtime()
+                          val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                          val maxHw = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                          val targetHw = if (volPercent <= 100) {
+                              ((volPercent / 100.0) * maxHw).roundToInt().coerceIn(0, maxHw)
+                          } else {
+                              maxHw
+                          }
+                          if (am.getStreamVolume(AudioManager.STREAM_MUSIC) != targetHw) {
+                              am.setStreamVolume(AudioManager.STREAM_MUSIC, targetHw, 0)
+                          }
+                      } catch (_: Throwable) {}
+                  }
 
-              private val notifUpdateRunnable = Runnable {
-                  postNotificationNow()
-              }
+                  fun computeTargetGainMb(): Int {
+                      if (isPaused) return 0
 
-              private val lockEnforcerRunnable = object : Runnable {
-                  override fun run() {
-                      if (!isPaused && currentMode == 0) {
-                          enforceStreamVolume(masterVol)
+                      return if (currentMode == 0) {
+                          // MODE 0: STEADY LOCK (Constant Decibel Level Compressor)
+                          // Feeds strong +2800 mB (+28 dB) drive into LoudnessEnhancer's internal 0 dBFS DRC limiter.
+                          // Quiet whispers/music are pulled up by +28 dB while loud beats are clamped at 0 dBFS!
+                          val baseCompressionDrive = 2800
+                          val toneDrive = ((bassVol - 50) * 8) + ((trebleVol - 50) * 8)
+                          val extraBoost = (masterVol - 100).coerceAtLeast(0) * 28
+                          (baseCompressionDrive + toneDrive + extraBoost).coerceIn(800, 9000)
+                      } else {
+                          // MODE 1: DYNAMIC BOOST (Pure Volume Booster GOODEV Engine)
+                          val boostAbove100 = (masterVol - 100).coerceAtLeast(0)
+                          val bassExtra = (bassVol - 100).coerceAtLeast(0) * 8
+                          val trebleExtra = (trebleVol - 100).coerceAtLeast(0) * 8
+                          // At 200% -> 3200 mB (+32 dB); at 300% -> 6400 mB (+64 dB)
+                          ((boostAbove100 * 32) + bassExtra + trebleExtra).coerceIn(0, 9000)
                       }
-                      mainHandler.postDelayed(this, 500L)
+                  }
+
+                  fun applyDspEngine() {
+                      val gainMb = computeTargetGainMb()
+                      val shouldEnable = (!isPaused && gainMb > 0)
+
+                      // 1. Apply to Global Mix (Session 0 - exactly how Volume Booster GOODEV works)
+                      try {
+                          if (globalEnhancer == null) {
+                              globalEnhancer = LoudnessEnhancer(0)
+                          }
+                          globalEnhancer?.setTargetGain(gainMb)
+                          globalEnhancer?.enabled = shouldEnable
+                      } catch (_: Throwable) {
+                          try { globalEnhancer?.release() } catch (_: Throwable) {}
+                          globalEnhancer = null
+                          try {
+                              globalEnhancer = LoudnessEnhancer(0).apply {
+                                  setTargetGain(gainMb)
+                                  enabled = shouldEnable
+                              }
+                          } catch (_: Throwable) {}
+                      }
+
+                      // 2. Also apply to any individual app sessions
+                      for ((sid, le) in sessionEnhancers) {
+                          try {
+                              le.setTargetGain(gainMb)
+                              le.enabled = shouldEnable
+                          } catch (_: Throwable) {
+                              sessionEnhancers.remove(sid)
+                          }
+                      }
+                  }
+
+                  fun attachAppSession(sessionId: Int) {
+                      if (sessionId <= 0) return
+                      val gainMb = computeTargetGainMb()
+                      val shouldEnable = (!isPaused && gainMb > 0)
+                      try {
+                          val le = sessionEnhancers.getOrPut(sessionId) { LoudnessEnhancer(sessionId) }
+                          le.setTargetGain(gainMb)
+                          le.enabled = shouldEnable
+                      } catch (_: Throwable) {}
+                  }
+
+                  fun releaseAllEnhancers() {
+                      try { globalEnhancer?.release() } catch (_: Throwable) {}
+                      globalEnhancer = null
+                      for ((_, le) in sessionEnhancers) {
+                          try { le.release() } catch (_: Throwable) {}
+                      }
+                      sessionEnhancers.clear()
+                  }
+
+                  fun ensureChannelAndPostNotif(ctx: Context, immediate: Boolean = false) {
+                      createNotificationChannel(ctx)
+                      val now = SystemClock.elapsedRealtime()
+                      if (immediate || (now - lastNotifTime) > 180L) {
+                          postNotifNow(ctx)
+                          mainHandler.postDelayed({ postNotifNow(ctx) }, 140L)
+                      } else {
+                          mainHandler.postDelayed({ postNotifNow(ctx) }, 120L)
+                      }
+                  }
+
+                  private fun postNotifNow(ctx: Context) {
+                      lastNotifTime = SystemClock.elapsedRealtime()
+                      try {
+                          val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                          nm.notify(NOTIF_ID, buildNotification(ctx))
+                      } catch (_: Throwable) {}
+                  }
+
+                  fun createNotificationChannel(ctx: Context) {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          val channel = NotificationChannel(
+                              CHANNEL_ID,
+                              "SteadyLock Audio Controls",
+                              NotificationManager.IMPORTANCE_LOW
+                          ).apply {
+                              description = "Live Volume Booster & Steady Lock Controls"
+                              setShowBadge(false)
+                          }
+                          val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                          nm.createNotificationChannel(channel)
+                      }
+                  }
+
+                  fun buildNotification(ctx: Context): Notification {
+                      val modeTitle = when {
+                          isPaused -> "PAUSED"
+                          currentMode == 0 -> "Steady Lock"
+                          else -> "Dynamic Boost"
+                      }
+
+                      val launchIntent = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)?.apply {
+                          flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                      }
+                      val contentPi = PendingIntent.getActivity(
+                          ctx, 0, launchIntent,
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+
+                      val downPi = PendingIntent.getService(
+                          ctx, 1,
+                          Intent(ctx, AudioLockService::class.java).setAction(ACTION_VOL_DOWN),
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+                      val upPi = PendingIntent.getService(
+                          ctx, 2,
+                          Intent(ctx, AudioLockService::class.java).setAction(ACTION_VOL_UP),
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+                      val modePi = PendingIntent.getService(
+                          ctx, 3,
+                          Intent(ctx, AudioLockService::class.java).setAction(ACTION_CYCLE_MODE),
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+
+                      val thirdBtnLabel = if (isPaused) "▶ Resume" else "🔄 Mode"
+
+                      val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          Notification.Builder(ctx, CHANNEL_ID)
+                      } else {
+                          Notification.Builder(ctx)
+                      }
+
+                      return builder
+                          .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
+                          .setContentTitle("SteadyLock • $modeTitle ($masterVol%)")
+                          .setContentText("Vol: $masterVol%  |  Bass: $bassVol%  |  Treble: $trebleVol%")
+                          .setOngoing(!isPaused)
+                          .setOnlyAlertOnce(true)
+                          .setContentIntent(contentPi)
+                          .addAction(Notification.Action.Builder(0, "➖ 10%", downPi).build())
+                          .addAction(Notification.Action.Builder(0, "➕ 10%", upPi).build())
+                          .addAction(Notification.Action.Builder(0, thirdBtnLabel, modePi).build())
+                          .build()
                   }
               }
 
-              private val audioSessionReceiver = object : BroadcastReceiver() {
+              // Re-hooks Session 0 LoudnessEnhancer whenever YouTube, Reels, Spotify or Games start playing
+              private val playbackCallback = object : AudioManager.AudioPlaybackCallback() {
+                  override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
+                      super.onPlaybackConfigChanged(configs)
+                      applyDspEngine()
+                  }
+              }
+
+              // Listens to physical Volume Up / Volume Down buttons so phone buttons NEVER get overridden!
+              private val receiver = object : BroadcastReceiver() {
                   override fun onReceive(context: Context?, intent: Intent?) {
-                      val sessionId = intent?.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, 0) ?: 0
-                      if (sessionId <= 0) return
                       when (intent?.action) {
+                          "android.media.VOLUME_CHANGED_ACTION" -> {
+                              val now = SystemClock.elapsedRealtime()
+                              // If user pressed physical volume buttons (>500ms after app set volume)
+                              if (now - lastAppHwSetTime > 500L && context != null) {
+                                  try {
+                                      val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                                      val maxHw = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                                      val curHw = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                                      val hwPct = ((curHw.toDouble() / maxHw.toDouble()) * 100.0).roundToInt().coerceIn(0, 100)
+                                      if (masterVol <= 100 || curHw < maxHw) {
+                                          if (masterVol != hwPct) {
+                                              masterVol = hwPct
+                                              externalSyncPending = true
+                                              applyDspEngine()
+                                              ensureChannelAndPostNotif(context, immediate = true)
+                                          }
+                                      }
+                                  } catch (_: Throwable) {}
+                              }
+                          }
                           AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION -> {
-                              attachSessionEffects(sessionId)
-                              applyEffectsToSession(sessionId)
+                              val sid = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, 0)
+                              attachAppSession(sid)
                           }
                           AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION -> {
-                              releaseSessionEffects(sessionId)
+                              val sid = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, 0)
+                              try { sessionEnhancers.remove(sid)?.release() } catch (_: Throwable) {}
                           }
                       }
                   }
@@ -271,347 +475,83 @@ jobs:
 
               override fun onCreate() {
                   super.onCreate()
-                  instance = this
-                  createNotificationChannel()
+                  createNotificationChannel(this)
+                  applyDspEngine()
 
-                  attachSessionEffects(0)
+                  try {
+                      val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                      am.registerAudioPlaybackCallback(playbackCallback, mainHandler)
+                  } catch (_: Throwable) {}
 
                   val filter = IntentFilter().apply {
+                      addAction("android.media.VOLUME_CHANGED_ACTION")
                       addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
                       addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
                   }
                   try {
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                          registerReceiver(audioSessionReceiver, filter, Context.RECEIVER_EXPORTED)
+                          registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
                       } else {
-                          registerReceiver(audioSessionReceiver, filter)
+                          registerReceiver(receiver, filter)
                       }
                   } catch (_: Throwable) {}
-
-                  mainHandler.post(lockEnforcerRunnable)
               }
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  val notif = buildNotification()
+                  when (intent?.action) {
+                      ACTION_VOL_DOWN -> {
+                          isPaused = false
+                          masterVol = (masterVol - 10).coerceIn(0, 300)
+                          setHardwareVolumeOnce(this, masterVol)
+                          externalSyncPending = true
+                      }
+                      ACTION_VOL_UP -> {
+                          isPaused = false
+                          masterVol = (masterVol + 10).coerceIn(0, 300)
+                          setHardwareVolumeOnce(this, masterVol)
+                          externalSyncPending = true
+                      }
+                      ACTION_CYCLE_MODE -> {
+                          if (isPaused) {
+                              isPaused = false
+                              currentMode = 0
+                          } else if (currentMode == 0) {
+                              currentMode = 1
+                          } else {
+                              isPaused = true
+                          }
+                          externalSyncPending = true
+                      }
+                  }
+
+                  val notif = buildNotification(this)
                   try {
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                           startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
                       } else {
                           startForeground(NOTIF_ID, notif)
                       }
-                  } catch (_: Throwable) {}
+                  } catch (_: Throwable) {
+                      try { startForeground(NOTIF_ID, notif) } catch (_: Throwable) {}
+                  }
 
-                  refreshAllAudio()
-                  scheduleNotificationUpdate(immediate = true)
+                  applyDspEngine()
+                  ensureChannelAndPostNotif(this, immediate = true)
                   return START_STICKY
-              }
-
-              fun refreshAllAudio() {
-                  if (!isPaused) {
-                      enforceStreamVolume(masterVol)
-                  }
-
-                  if (!loudnessMap.containsKey(0) && !eqMap.containsKey(0)) {
-                      attachSessionEffects(0)
-                  }
-
-                  val sessions = HashSet<Int>()
-                  sessions.add(0)
-                  sessions.addAll(loudnessMap.keys)
-                  sessions.addAll(eqMap.keys)
-                  sessions.addAll(dpMap.keys)
-
-                  for (sid in sessions) {
-                      applyEffectsToSession(sid)
-                  }
-              }
-
-              private fun enforceStreamVolume(volPercent: Int) {
-                  try {
-                      val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                      val maxHw = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                      val currentHw = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-
-                      if (volPercent <= 100) {
-                          val targetHw = ((volPercent / 100.0) * maxHw).roundToInt().coerceIn(0, maxHw)
-                          if (currentHw != targetHw) {
-                              am.setStreamVolume(AudioManager.STREAM_MUSIC, targetHw, 0)
-                          }
-                      } else {
-                          if (currentHw < maxHw) {
-                              am.setStreamVolume(AudioManager.STREAM_MUSIC, maxHw, 0)
-                          }
-                      }
-                  } catch (_: Throwable) {}
-              }
-
-              private fun attachSessionEffects(sessionId: Int) {
-                  if (!loudnessMap.containsKey(sessionId)) {
-                      try {
-                          val le = LoudnessEnhancer(sessionId)
-                          le.enabled = true
-                          loudnessMap[sessionId] = le
-                      } catch (_: Throwable) {}
-                  }
-
-                  if (!eqMap.containsKey(sessionId)) {
-                      try {
-                          val eq = Equalizer(100, sessionId)
-                          eq.enabled = true
-                          eqMap[sessionId] = eq
-                      } catch (_: Throwable) {}
-                  }
-
-                  if (!bassMap.containsKey(sessionId)) {
-                      try {
-                          val bb = BassBoost(100, sessionId)
-                          bb.enabled = true
-                          bassMap[sessionId] = bb
-                      } catch (_: Throwable) {}
-                  }
-
-                  if (sessionId > 0 && !dpMap.containsKey(sessionId) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                      try {
-                          val builder = DynamicsProcessing.Config.Builder(
-                              DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
-                              2,
-                              true, 5,
-                              false, 0,
-                              false, 0,
-                              true
-                          )
-                          val dp = DynamicsProcessing(100, sessionId, builder.build())
-                          dp.enabled = true
-                          dpMap[sessionId] = dp
-                      } catch (_: Throwable) {}
-                  }
-              }
-
-              private fun applyEffectsToSession(sessionId: Int) {
-                  val active = !isPaused
-
-                  loudnessMap[sessionId]?.let { le ->
-                      try {
-                          if (!active) {
-                              le.setTargetGain(0)
-                              le.enabled = false
-                          } else {
-                              val boostPercent = (masterVol - 100).coerceAtLeast(0)
-                              val modeMultiplier = when (currentMode) {
-                                  0 -> 30
-                                  1 -> 60
-                                  else -> 90
-                              }
-                              val gainMb = boostPercent * modeMultiplier
-                              le.setTargetGain(gainMb)
-                              le.enabled = true
-                          }
-                      } catch (_: Throwable) {}
-                  }
-
-                  eqMap[sessionId]?.let { eq ->
-                      try {
-                          if (!active) {
-                              eq.enabled = false
-                          } else {
-                              eq.enabled = true
-                              val numBands = eq.numberOfBands.toInt()
-                              val range = eq.bandLevelRange
-                              val minMb = range[0].toInt()
-                              val maxMb = range[1].toInt()
-
-                              val masterExtraMb = if (masterVol > 100) ((masterVol - 100) * 8) else 0
-                              val bassDeltaMb = (bassVol - 100) * 8
-                              val trebleDeltaMb = (trebleVol - 100) * 8
-
-                              for (b in 0 until numBands) {
-                                  val freqMilliHz = eq.getCenterFreq(b.toShort())
-                                  var targetMb = masterExtraMb
-
-                                  if (freqMilliHz < 300_000) {
-                                      targetMb += bassDeltaMb
-                                      if (currentMode == 2) targetMb += 500
-                                  } else if (freqMilliHz > 2_500_000) {
-                                      targetMb += trebleDeltaMb
-                                      if (currentMode == 0) targetMb += 300
-                                  } else {
-                                      if (currentMode == 0) targetMb += 400
-                                  }
-
-                                  val clamped = targetMb.coerceIn(minMb, maxMb).toShort()
-                                  eq.setBandLevel(b.toShort(), clamped)
-                              }
-                          }
-                      } catch (_: Throwable) {}
-                  }
-
-                  bassMap[sessionId]?.let { bb ->
-                      try {
-                          if (!active) {
-                              bb.enabled = false
-                          } else {
-                              bb.enabled = true
-                              val strength = ((bassVol / 300.0) * 1000.0).roundToInt().coerceIn(0, 1000).toShort()
-                              bb.setStrength(strength)
-                          }
-                      } catch (_: Throwable) {}
-                  }
-
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                      dpMap[sessionId]?.let { dp ->
-                          try {
-                              if (!active) {
-                                  dp.enabled = false
-                              } else {
-                                  dp.enabled = true
-                                  val inputGainDb = if (masterVol > 100) ((masterVol - 100) * 0.3f) else 0f
-                                  dp.setInputGainAllChannelsTo(inputGainDb)
-
-                                  val limiter = if (currentMode == 0) {
-                                      DynamicsProcessing.Limiter(true, true, 0, 0.1f, 10.0f, 35.0f, -4.0f, 0.0f)
-                                  } else {
-                                      DynamicsProcessing.Limiter(true, true, 0, 2.0f, 40.0f, 5.0f, -1.0f, 0.0f)
-                                  }
-                                  dp.setLimiterAllChannelsTo(limiter)
-                              }
-                          } catch (_: Throwable) {}
-                      }
-                  }
-              }
-
-              private fun releaseSessionEffects(sessionId: Int) {
-                  try { loudnessMap.remove(sessionId)?.release() } catch (_: Throwable) {}
-                  try { eqMap.remove(sessionId)?.release() } catch (_: Throwable) {}
-                  try { bassMap.remove(sessionId)?.release() } catch (_: Throwable) {}
-                  try { dpMap.remove(sessionId)?.release() } catch (_: Throwable) {}
-              }
-
-              fun scheduleNotificationUpdate(immediate: Boolean) {
-                  mainHandler.removeCallbacks(notifUpdateRunnable)
-                  val now = SystemClock.elapsedRealtime()
-                  if (immediate || (now - lastNotifTime) > 200L) {
-                      postNotificationNow()
-                      mainHandler.postDelayed(notifUpdateRunnable, 100L)
-                  } else {
-                      mainHandler.postDelayed(notifUpdateRunnable, 100L)
-                  }
-              }
-
-              private fun postNotificationNow() {
-                  lastNotifTime = SystemClock.elapsedRealtime()
-                  try {
-                      val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                      nm.notify(NOTIF_ID, buildNotification())
-                  } catch (_: Throwable) {}
-              }
-
-              private fun buildNotification(): Notification {
-                  val modeTitle = when {
-                      isPaused -> "PAUSED (Bypass)"
-                      currentMode == 0 -> "Steady Lock"
-                      currentMode == 1 -> "Boost + EQ"
-                      else -> "Cinema Bass"
-                  }
-
-                  val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
-                      flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                  }
-                  val contentPi = PendingIntent.getActivity(
-                      this, 0, launchIntent,
-                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                  )
-
-                  val downPi = PendingIntent.getBroadcast(
-                      this, 1,
-                      Intent(this, NotifActionReceiver::class.java).setAction(ACTION_VOL_DOWN),
-                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                  )
-                  val upPi = PendingIntent.getBroadcast(
-                      this, 2,
-                      Intent(this, NotifActionReceiver::class.java).setAction(ACTION_VOL_UP),
-                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                  )
-                  val modePi = PendingIntent.getBroadcast(
-                      this, 3,
-                      Intent(this, NotifActionReceiver::class.java).setAction(ACTION_CYCLE_MODE),
-                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                  )
-
-                  val thirdBtnLabel = if (isPaused) "▶ Resume" else "🔄 Mode"
-
-                  return NotificationCompat.Builder(this, CHANNEL_ID)
-                      .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
-                      .setContentTitle("SteadyLock • $modeTitle ($masterVol%)")
-                      .setContentText("Vol: $masterVol%  |  Bass: $bassVol%  |  Treble: $trebleVol%")
-                      .setOngoing(!isPaused)
-                      .setOnlyAlertOnce(true)
-                      .setSilent(true)
-                      .setPriority(NotificationCompat.PRIORITY_LOW)
-                      .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-                      .setContentIntent(contentPi)
-                      .addAction(0, "➖ 10%", downPi)
-                      .addAction(0, "➕ 10%", upPi)
-                      .addAction(0, thirdBtnLabel, modePi)
-                      .build()
-              }
-
-              private fun createNotificationChannel() {
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      val channel = NotificationChannel(
-                          CHANNEL_ID,
-                          "SteadyLock Live Controls",
-                          NotificationManager.IMPORTANCE_LOW
-                      ).apply {
-                          description = "Live Volume, Mode Switch & Audio Lock Controls"
-                          setShowBadge(false)
-                      }
-                      val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                      nm.createNotificationChannel(channel)
-                  }
               }
 
               override fun onDestroy() {
                   mainHandler.removeCallbacksAndMessages(null)
-                  try { unregisterReceiver(audioSessionReceiver) } catch (_: Throwable) {}
-                  for (sid in HashSet(loudnessMap.keys)) {
-                      releaseSessionEffects(sid)
-                  }
-                  instance = null
+                  try {
+                      val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                      am.unregisterAudioPlaybackCallback(playbackCallback)
+                  } catch (_: Throwable) {}
+                  try { unregisterReceiver(receiver) } catch (_: Throwable) {}
+                  releaseAllEnhancers()
                   super.onDestroy()
               }
 
               override fun onBind(intent: Intent?): IBinder? = null
-          }
-
-          class NotifActionReceiver : BroadcastReceiver() {
-              override fun onReceive(context: Context, intent: Intent?) {
-                  when (intent?.action) {
-                      AudioLockService.ACTION_VOL_DOWN -> {
-                          AudioLockService.isPaused = false
-                          AudioLockService.masterVol = (AudioLockService.masterVol - 10).coerceIn(0, 300)
-                      }
-                      AudioLockService.ACTION_VOL_UP -> {
-                          AudioLockService.isPaused = false
-                          AudioLockService.masterVol = (AudioLockService.masterVol + 10).coerceIn(0, 300)
-                      }
-                      AudioLockService.ACTION_CYCLE_MODE -> {
-                          if (AudioLockService.isPaused) {
-                              AudioLockService.isPaused = false
-                              AudioLockService.currentMode = 0
-                          } else if (AudioLockService.currentMode < 2) {
-                                AudioLockService.currentMode += 1
-                          } else {
-                              AudioLockService.isPaused = true
-                          }
-                      }
-                  }
-
-                  AudioLockService.externalSyncPending = true
-                  AudioLockService.instance?.let { svc ->
-                      svc.refreshAllAudio()
-                      svc.scheduleNotificationUpdate(immediate = true)
-                  }
-              }
           }
           EOF
 
